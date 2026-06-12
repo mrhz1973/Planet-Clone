@@ -46,16 +46,29 @@
     viewer.scene.globe.baseColor = Cesium.Color.BLACK;
     viewer.scene.skyAtmosphere.show = false;
 
-    // --- Unico strato: Navionics, servito dal proxy Python locale (proxy.py) ---
-    // La carta nautica (transparent=false) e' opaca: fa da mappa di base.
-    const navionicsProvider = new Cesium.UrlTemplateImageryProvider({
+    // --- Strato base: Seachart Navionics (carta nautica, opaca) ---
+    // Servito dal proxy Python locale (proxy.py), fa da mappa di base.
+    const seachartProvider = new Cesium.UrlTemplateImageryProvider({
       url: "http://localhost:5000/tiles/{z}/{x}/{y}.png",
       minimumLevel: 1,
       maximumLevel: 18,
       credit: "Carte nautiche © Navionics (Garmin) via proxy locale"
     });
 
-    viewer.imageryLayers.addImageryProvider(navionicsProvider);
+    viewer.imageryLayers.addImageryProvider(seachartProvider);
+
+    // --- Overlay: SonarChart Navionics (batimetria, trasparente) ---
+    // Si sovrappone alla Seachart; dove non c'e' copertura i tile sono vuoti.
+    const sonarProvider = new Cesium.UrlTemplateImageryProvider({
+      url: "http://localhost:5000/sonar/{z}/{x}/{y}.png",
+      minimumLevel: 1,
+      maximumLevel: 18,
+      credit: "SonarChart © Navionics (Garmin) via proxy locale"
+    });
+
+    const sonarLayer = viewer.imageryLayers.addImageryProvider(sonarProvider);
+    // Imposta a false per nascondere la SonarChart e vedere solo la carta nautica.
+    sonarLayer.show = true;
 
     // Golfo di Napoli: zona costiera, ideale per vedere subito la carta nautica
     viewer.camera.flyTo({
