@@ -26,10 +26,14 @@ Espone DUE carte Navionics (stesso flusso token, cambia solo "layer"):
 Espone inoltre Google Satellite (handler separato, NO token Navionics):
   - /gsat/{z}/{x}/{y}.jpg   -> Google Satellite (version discovery + fallback mt)
 
+Espone Bing Satellite (handler separato, NO token Navionics):
+  - /bsat/{z}/{x}/{y}.jpg   -> Bing Satellite (quadkey + version discovery / env)
+
 Avvio:  python proxy.py
 Carta:  http://localhost:5000/tiles/{z}/{x}/{y}.png
 Sonar:  http://localhost:5000/sonar/{z}/{x}/{y}.png
 G.Sat:  http://localhost:5000/gsat/{z}/{x}/{y}.jpg
+B.Sat:  http://localhost:5000/bsat/{z}/{x}/{y}.jpg
 Stato:  http://localhost:5000/status
 """
 
@@ -248,6 +252,155 @@ def _gsat_status_payload():
     }
 
 
+# ---------------------------------------------------------------------------
+# Bing Satellite (WU-0009B) — handler separato da Navionics e Google Satellite.
+# cache_dir_name / chart id "bsat" e' solo etichetta (pass-through, no cache disco).
+# z dalla route = XYZ standard 0-based: quadkey Bing canonico, nessun offset SAS z-1.
+# ---------------------------------------------------------------------------
+BSAT_CHART_ID = "bsat"
+BING_MAPS_URL = "https://www.bing.com/maps"
+_BSAT_VERSION_RE = re.compile(
+    r"https?://[^\"'\s]*(?:ssl\.ak\.)?tiles\.virtualearth\.net[^\"'\s]*[?&]g=(\d+)",
+    re.IGNORECASE,
+)
+BING_STATIC_VERSION = (os.environ.get("BING_STATIC_VERSION") or "").strip() or None
+BING_VERSION_TTL = int(os.environ.get("BING_VERSION_TTL", "3600"))
+BING_REFERER = "https://www.bing.com/"
+
+_bsat_lock = threading.Lock()
+_bsat_version_state = {
+    "version": None,
+    "source": None,
+    "fetched_at": 0.0,
+    "error": None,
+}
+
+
+def _bing_quadkey(z, x, y):
+    """Quadkey Bing canonico: z passato cosi' com'e', bit x/y per livello da z a 1."""
+    quadkey = []
+    for level in range(z, 0, -1):
+        digit = 0
+        mask = 1 << (level - 1)
+        if x & mask:
+            digit += 1
+        if y & mask:
+            digit += 2
+        quadkey.append(str(digit))
+    return "".join(quadkey)
+
+
+def _pick_bsat_subdomain(quadkey):
+    return len(quadkey) % 8
+
+
+def _bsat_discovery_headers():
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Referer": BING_REFERER,
+    }
+
+
+def _bsat_tile_headers():
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "image/webp,image/apng,image/jpeg,image/*,*/*;q=0.8",
+        "Referer": BING_REFERER,
+    }
+
+
+def _discover_bsat_version_unlocked():
+    """Regex ancorata a URL tile Virtual Earth; chiamare solo con _bsat_lock."""
+    try:
+        resp = _session.get(
+            BING_MAPS_URL,
+            headers=_bsat_discovery_headers(),
+            timeout=15,
+        )
+        resp.raise_for_status()
+        match = _BSAT_VERSION_RE.search(resp.text)
+        if match:
+            ver = match.group(1)
+            _bsat_version_state.update(
+                version=ver, source="discovery", fetched_at=time.time(), error=None,
+            )
+            print(f"[proxy] Bing Satellite version discovered: g={ver}")
+            return ver
+        _bsat_version_state["error"] = "version regex no match in bing.com/maps"
+        print("[proxy] Bing Satellite: version regex no match")
+    except Exception as exc:
+        _bsat_version_state["error"] = str(exc)
+        print(f"[proxy] Bing Satellite version discovery failed: {exc}")
+    return None
+
+
+def _ensure_bsat_version(force=False):
+    """Version cache process-level con lock; fallback statico da env."""
+    with _bsat_lock:
+        cached = _bsat_version_state.get("version")
+        age = time.time() - float(_bsat_version_state.get("fetched_at") or 0)
+        if not force and cached and age < BING_VERSION_TTL:
+            return cached, _bsat_version_state.get("source") or "discovery"
+
+        ver = _discover_bsat_version_unlocked()
+        if ver:
+            return ver, "discovery"
+
+        if BING_STATIC_VERSION:
+            _bsat_version_state.update(
+                version=BING_STATIC_VERSION,
+                source="static",
+                fetched_at=time.time(),
+                error=None,
+            )
+            print(f"[proxy] Bing Satellite using static version g={BING_STATIC_VERSION}")
+            return BING_STATIC_VERSION, "static"
+
+        _bsat_version_state.update(version=None, source=None, fetched_at=time.time())
+        return None, None
+
+
+def _fetch_bsat_tile_bytes(z, x, y):
+    """Pass-through Bing tile: quadkey canonico + versione discovery/env."""
+    version, _src = _ensure_bsat_version()
+    if not version:
+        print(f"[proxy] bsat {z}/{x}/{y}: no Bing version (discovery failed, no env)")
+        return None
+
+    quadkey = _bing_quadkey(z, x, y)
+    s = _pick_bsat_subdomain(quadkey)
+    url = (
+        f"https://t{s}.ssl.ak.tiles.virtualearth.net/tiles/a{quadkey}.jpeg"
+        f"?g={version}"
+    )
+    try:
+        resp = _session.get(url, headers=_bsat_tile_headers(), timeout=15)
+        ctype = resp.headers.get("content-type", "")
+        if resp.status_code == 200 and resp.content and "image" in ctype:
+            return resp.content
+        print(f"[proxy] bsat {z}/{x}/{y} -> {resp.status_code} ({ctype})")
+    except requests.RequestException as exc:
+        print(f"[proxy] bsat {z}/{x}/{y}: {exc}")
+    return None
+
+
+def _bsat_status_payload():
+    version, source = _ensure_bsat_version()
+    age = time.time() - float(_bsat_version_state.get("fetched_at") or 0)
+    return {
+        "route": "/bsat/{z}/{x}/{y}.jpg",
+        "cache_dir_name": BSAT_CHART_ID,
+        "version": version,
+        "version_source": source,
+        "version_age_sec": round(age, 1) if _bsat_version_state.get("fetched_at") else None,
+        "static_fallback_configured": bool(BING_STATIC_VERSION),
+        "discovery_host": "www.bing.com",
+        "tile_hosts": ["*.ssl.ak.tiles.virtualearth.net"],
+        "last_error": _bsat_version_state.get("error"),
+    }
+
+
 def _base_headers():
     return {"User-Agent": USER_AGENT, "Origin": ORIGIN, "Referer": ORIGIN + "/", "Accept": "*/*"}
 
@@ -299,8 +452,10 @@ def status():
             "seachart": "/tiles/{z}/{x}/{y}.png",
             "sonarchart": "/sonar/{z}/{x}/{y}.png",
             "gsat": "/gsat/{z}/{x}/{y}.jpg",
+            "bsat": "/bsat/{z}/{x}/{y}.jpg",
         },
         "gsat": _gsat_status_payload(),
+        "bsat": _bsat_status_payload(),
         "last_error": _state["error"],
     })
 
@@ -359,11 +514,21 @@ def proxy_gsat(z, x, y):
     return jsonify({"error": "gsat tile unavailable", "z": z, "x": x, "y": y}), 502
 
 
+@app.route("/bsat/<int:z>/<int:x>/<int:y>.jpg")
+def proxy_bsat(z, x, y):
+    """Bing Satellite — z XYZ 0-based dal client, quadkey canonico senza offset SAS."""
+    data = _fetch_bsat_tile_bytes(z, x, y)
+    if data:
+        return send_file(io.BytesIO(data), mimetype="image/jpeg")
+    return jsonify({"error": "bsat tile unavailable", "z": z, "x": x, "y": y}), 502
+
+
 if __name__ == "__main__":
     print("Proxy Navionics (Garmin) con auto-refresh su http://localhost:5000")
     print("Carta: http://localhost:5000/tiles/{z}/{x}/{y}.png  (Seachart)")
     print("Sonar: http://localhost:5000/sonar/{z}/{x}/{y}.png  (SonarChart)")
     print("G.Sat: http://localhost:5000/gsat/{z}/{x}/{y}.jpg  (Google Satellite)")
+    print("B.Sat: http://localhost:5000/bsat/{z}/{x}/{y}.jpg  (Bing Satellite)")
     print("Stato: http://localhost:5000/status")
     if _ensure_tokens()[0]:
         print("Token iniziali ottenuti automaticamente. Tutto pronto.\n")
@@ -375,4 +540,9 @@ if __name__ == "__main__":
         print(f"Google Satellite version pronta: v={ver} (source={src})\n")
     else:
         print("[INFO] Google Satellite: nessuna versione khms; i tile useranno fallback mt.\n")
+    bver, bsrc = _ensure_bsat_version()
+    if bver:
+        print(f"Bing Satellite version pronta: g={bver} (source={bsrc})\n")
+    else:
+        print("[INFO] Bing Satellite: nessuna versione (discovery fallita, env assente).\n")
     app.run(port=5000, debug=False, threaded=True)
