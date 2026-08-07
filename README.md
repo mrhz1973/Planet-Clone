@@ -105,6 +105,11 @@ doppio clic sul file `file://`, altrimenti Cesium e le chiamate al proxy fallisc
 
 Diagnostica token: **http://localhost:5000/status** → deve mostrare `"tokens_ok": true`.
 
+Overlay raster aggiuntivi (pass-through allowlisted, senza token Navionics):
+
+- Strava Heatmap Run (maxZoom 11): **http://localhost:5000/strava-run/{z}/{x}/{y}.png**
+- Hillshade OSM US (maxZoom 12): **http://localhost:5000/hillshade/{z}/{x}/{y}.jpg**
+
 ## ⚙️ Configurazione (variabili d'ambiente, opzionali)
 
 | Variabile | Default | Significato |

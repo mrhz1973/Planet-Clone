@@ -29,11 +29,17 @@ Espone inoltre Google Satellite (handler separato, NO token Navionics):
 Espone Bing Satellite (handler separato, NO token Navionics):
   - /bsat/{z}/{x}/{y}.jpg   -> Bing Satellite (quadkey + version discovery / env)
 
+Espone overlay raster allowlisted (handler separati, NO token Navionics):
+  - /strava-run/{z}/{x}/{y}.png -> Strava Heatmap Run (maxZoom 11)
+  - /hillshade/{z}/{x}/{y}.jpg  -> OSM US hillshade (maxZoom 12)
+
 Avvio:  python proxy.py
 Carta:  http://localhost:5000/tiles/{z}/{x}/{y}.png
 Sonar:  http://localhost:5000/sonar/{z}/{x}/{y}.png
 G.Sat:  http://localhost:5000/gsat/{z}/{x}/{y}.jpg
 B.Sat:  http://localhost:5000/bsat/{z}/{x}/{y}.jpg
+Strava: http://localhost:5000/strava-run/{z}/{x}/{y}.png
+Hillsh: http://localhost:5000/hillshade/{z}/{x}/{y}.jpg
 Stato:  http://localhost:5000/status
 """
 
@@ -401,6 +407,74 @@ def _bsat_status_payload():
     }
 
 
+# ---------------------------------------------------------------------------
+# Overlay raster allowlisted (Strava Run + OSM US hillshade) — pass-through.
+# Nessuna auth GIS/OPSEC qui: il client GIS decide quando chiamare queste route.
+# ---------------------------------------------------------------------------
+STRAVA_SUBDOMAINS = ("a", "b", "c")
+STRAVA_MAX_ZOOM = 11
+HILLSHADE_MAX_ZOOM = 12
+HILLSHADE_UPSTREAM = (
+    "https://tiles.openstreetmap.us/raster/hillshade/{z}/{x}/{y}.jpg"
+)
+
+
+def _valid_xyz(z, x, y):
+    """XYZ WebMercator difensivo: z 0..22, x/y in [0, 2**z)."""
+    try:
+        z = int(z)
+        x = int(x)
+        y = int(y)
+    except (TypeError, ValueError):
+        return False
+    if z < 0 or z > 22 or x < 0 or y < 0:
+        return False
+    n = 1 << z
+    return x < n and y < n
+
+
+def _overlay_tile_headers():
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "image/*,*/*;q=0.8",
+    }
+
+
+def _strava_run_upstream_url(z, x, y):
+    sub = STRAVA_SUBDOMAINS[abs(x + y) % len(STRAVA_SUBDOMAINS)]
+    return (
+        f"https://heatmap-external-{sub}.strava.com/tiles/run/hot/{z}/{x}/{y}.png"
+    )
+
+
+def _fetch_strava_run_tile_bytes(z, x, y):
+    """Pass-through Strava public heatmap run; caller deve rispettare maxZoom."""
+    url = _strava_run_upstream_url(z, x, y)
+    try:
+        resp = _session.get(url, headers=_overlay_tile_headers(), timeout=15)
+        ctype = resp.headers.get("content-type", "")
+        if resp.status_code == 200 and resp.content and "image" in ctype:
+            return resp.content
+        print(f"[proxy] strava-run {z}/{x}/{y} -> {resp.status_code} ({ctype})")
+    except requests.RequestException as exc:
+        print(f"[proxy] strava-run {z}/{x}/{y}: {exc}")
+    return None
+
+
+def _fetch_hillshade_tile_bytes(z, x, y):
+    """Pass-through OSM US hillshade JPEG; caller deve rispettare maxZoom."""
+    url = HILLSHADE_UPSTREAM.format(z=z, x=x, y=y)
+    try:
+        resp = _session.get(url, headers=_overlay_tile_headers(), timeout=15)
+        ctype = resp.headers.get("content-type", "")
+        if resp.status_code == 200 and resp.content and "image" in ctype:
+            return resp.content
+        print(f"[proxy] hillshade {z}/{x}/{y} -> {resp.status_code} ({ctype})")
+    except requests.RequestException as exc:
+        print(f"[proxy] hillshade {z}/{x}/{y}: {exc}")
+    return None
+
+
 def _base_headers():
     return {"User-Agent": USER_AGENT, "Origin": ORIGIN, "Referer": ORIGIN + "/", "Accept": "*/*"}
 
@@ -453,6 +527,8 @@ def status():
             "sonarchart": "/sonar/{z}/{x}/{y}.png",
             "gsat": "/gsat/{z}/{x}/{y}.jpg",
             "bsat": "/bsat/{z}/{x}/{y}.jpg",
+            "strava_run": "/strava-run/{z}/{x}/{y}.png",
+            "hillshade": "/hillshade/{z}/{x}/{y}.jpg",
         },
         "gsat": _gsat_status_payload(),
         "bsat": _bsat_status_payload(),
@@ -523,12 +599,48 @@ def proxy_bsat(z, x, y):
     return jsonify({"error": "bsat tile unavailable", "z": z, "x": x, "y": y}), 502
 
 
+@app.route("/strava-run/<int:z>/<int:x>/<int:y>.png")
+def proxy_strava_run(z, x, y):
+    """Strava Heatmap Run — overlay PNG pubblico, maxZoom 11, nessun remapping XYZ."""
+    if not _valid_xyz(z, x, y) or z > STRAVA_MAX_ZOOM:
+        if z > STRAVA_MAX_ZOOM:
+            print(f"[proxy] strava-run {z}/{x}/{y}: maxZoom {STRAVA_MAX_ZOOM} exceeded")
+        else:
+            print(f"[proxy] strava-run {z}/{x}/{y}: invalid XYZ")
+        return send_file(io.BytesIO(TRANSPARENT_PNG), mimetype="image/png")
+
+    data = _fetch_strava_run_tile_bytes(z, x, y)
+    if data:
+        return send_file(io.BytesIO(data), mimetype="image/png")
+    return send_file(io.BytesIO(TRANSPARENT_PNG), mimetype="image/png")
+
+
+@app.route("/hillshade/<int:z>/<int:x>/<int:y>.jpg")
+def proxy_hillshade(z, x, y):
+    """OSM US hillshade JPEG — maxZoom 12, nessun fallback multi-provider."""
+    if not _valid_xyz(z, x, y) or z > HILLSHADE_MAX_ZOOM:
+        if z > HILLSHADE_MAX_ZOOM:
+            print(f"[proxy] hillshade {z}/{x}/{y}: maxZoom {HILLSHADE_MAX_ZOOM} exceeded")
+        else:
+            print(f"[proxy] hillshade {z}/{x}/{y}: invalid XYZ")
+        return jsonify(
+            {"error": "hillshade tile unavailable", "z": z, "x": x, "y": y}
+        ), 502
+
+    data = _fetch_hillshade_tile_bytes(z, x, y)
+    if data:
+        return send_file(io.BytesIO(data), mimetype="image/jpeg")
+    return jsonify({"error": "hillshade tile unavailable", "z": z, "x": x, "y": y}), 502
+
+
 if __name__ == "__main__":
     print("Proxy Navionics (Garmin) con auto-refresh su http://localhost:5000")
     print("Carta: http://localhost:5000/tiles/{z}/{x}/{y}.png  (Seachart)")
     print("Sonar: http://localhost:5000/sonar/{z}/{x}/{y}.png  (SonarChart)")
     print("G.Sat: http://localhost:5000/gsat/{z}/{x}/{y}.jpg  (Google Satellite)")
     print("B.Sat: http://localhost:5000/bsat/{z}/{x}/{y}.jpg  (Bing Satellite)")
+    print("Strava: http://localhost:5000/strava-run/{z}/{x}/{y}.png  (Heatmap Run)")
+    print("Hillsh: http://localhost:5000/hillshade/{z}/{x}/{y}.jpg  (OSM US)")
     print("Stato: http://localhost:5000/status")
     if _ensure_tokens()[0]:
         print("Token iniziali ottenuti automaticamente. Tutto pronto.\n")
